@@ -1,0 +1,6 @@
+target/
+.embuild/
+.cargo/
+.env
+set.sh
+

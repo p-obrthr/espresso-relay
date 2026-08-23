@@ -1,0 +1,25 @@
+[package]
+name = "espresso-relay"
+edition = "2021"
+
+[[bin]]
+name = "espresso-relay"
+harness = false
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[dependencies]
+log = "0.4"
+esp-idf-svc = { version = "0.52", features = ["critical-section"] }
+embedded-svc = "0.29.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+
+[build-dependencies]
+embuild = "0.33"
