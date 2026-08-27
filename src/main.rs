@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local, TimeZone};
+use chrono::{DateTime, Local};
 use embedded_svc::http::client::Client;
 use embedded_svc::http::{Headers, Method};
 use embedded_svc::io::{Read, Write};
@@ -11,12 +11,12 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sntp::{EspSntp, SntpConf, SyncStatus};
 use esp_idf_svc::wifi::{
     AuthMethod, BlockingWifi, ClientConfiguration, Configuration as WifiConfiguration, EspWifi,
-    WifiEvent,
 };
 use serde::Deserialize;
 use serde_json::json;
 use std::env;
 use std::error::Error;
+use std::option::Option;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -31,7 +31,7 @@ const WIFI_SSID: &str = env!("WIFI_SSID");
 const WIFI_PW: &str = env!("WIFI_PW");
 const DEVICE_ENDPOINT: &str = env!("DEVICE_ENDPOINT");
 
-fn run_http(entry: &Arc<Mutex<SwitchEntry>>) {
+fn run_http(entry: &Arc<Mutex<Option<SwitchEntry>>>) {
     let mut httpserver = EspHttpServer::new(&HttpServerConfig::default()).unwrap();
 
     let entry_get = Arc::clone(entry);
@@ -64,7 +64,7 @@ fn run_http(entry: &Arc<Mutex<SwitchEntry>>) {
                 match serde_json::from_slice::<SwitchEntry>(&buf) {
                     Ok(set) => {
                         let mut entry = entry_set.lock().unwrap();
-                        *entry = SwitchEntry { time: set.time };
+                        *entry = Some(SwitchEntry { time: set.time });
                         write!(resp, "accepted")?;
                     }
 
@@ -78,23 +78,131 @@ fn run_http(entry: &Arc<Mutex<SwitchEntry>>) {
         )
         .unwrap();
 
+    httpserver
+        .fn_handler("/on", Method::Get, |req| -> Result<(), Box<dyn Error>> {
+            let body = json!({
+                "id": 1,
+                "method": "Switch.Set",
+                "params": {
+                    "id": 0,
+                    "on": true,
+                }
+            });
+
+            request(&body)?;
+
+            let mut resp = req.into_ok_response()?;
+            resp.write_all(b"okay")?;
+
+            Ok(())
+        })
+        .unwrap();
+
+    httpserver
+        .fn_handler("/off", Method::Get, |req| -> Result<(), Box<dyn Error>> {
+            let body = json!({
+                "id": 1,
+                "method": "Switch.Set",
+                "params": {
+                    "id": 0,
+                    "on": false,
+                }
+            });
+
+            request(&body)?;
+
+            let mut resp = req.into_ok_response()?;
+            resp.write_all(b"okay")?;
+
+            Ok(())
+        })
+        .unwrap();
+
+    httpserver
+        .fn_handler(
+            "/status",
+            Method::Get,
+            |req| -> Result<(), Box<dyn Error>> {
+                let body = json!({
+                    "id": 1,
+                    "method": "Switch.GetStatus",
+                    "params": {
+                        "id": 0
+                    }
+                });
+
+                let result = request(&body)?;
+
+                let mut resp = req.into_ok_response()?;
+                resp.write_all(result.as_bytes())?;
+
+                Ok(())
+            },
+        )
+        .unwrap();
+
     loop {
         thread::sleep(Duration::from_secs(1));
     }
 }
 
-fn connect_wifi<'a>(
-    modem: esp_idf_svc::hal::modem::Modem<'a>,
-    sysloop: &'a EspSystemEventLoop,
-    nvs: EspDefaultNvsPartition,
-) -> Result<BlockingWifi<EspWifi<'a>>, Box<dyn Error>> {
-    let _wifi_events = sysloop.subscribe::<WifiEvent, _>(|event| {
-        log::warn!("WIFI EVENT: {:?}", event);
-    })?;
+fn request(body: &serde_json::Value) -> Result<String, Box<dyn Error>> {
+    let body = serde_json::to_vec(body)?;
 
-    let esp_wifi = EspWifi::new(modem, sysloop.clone(), Some(nvs))?;
-    let mut wifi = BlockingWifi::wrap(esp_wifi, sysloop.clone())?;
+    let content_length = body.len().to_string();
 
+    let headers = [
+        ("Content-Type", "application/json"),
+        ("Content-Length", content_length.as_str()),
+    ];
+
+    let connection = EspHttpConnection::new(&HttpConfiguration::default())?;
+    let mut client = Client::wrap(connection);
+
+    let mut request = client.request(Method::Post, DEVICE_ENDPOINT, &headers)?;
+
+    request.write_all(&body)?;
+
+    let mut response = request.submit()?;
+
+    let status = response.status();
+
+    log::info!("Switch.GetStatus HTTP status: {}", status);
+
+    let mut buf = [0u8; 512];
+    let mut response_body = Vec::new();
+
+    loop {
+        match response.read(&mut buf) {
+            Ok(0) => break,
+
+            Ok(n) => {
+                response_body.extend_from_slice(&buf[..n]);
+            }
+
+            Err(e) => {
+                log::error!("error reading response: {:?}", e);
+                break;
+            }
+        }
+    }
+
+    let response_body = String::from_utf8(response_body)?;
+
+    log::info!("response: {}", response_body);
+
+    if status != 200 {
+        return Err(format!(
+            "Request to device failed with HTTP status {}: {}",
+            status, response_body
+        )
+        .into());
+    }
+
+    Ok(response_body)
+}
+
+fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<(), Box<dyn Error>> {
     wifi.set_configuration(&WifiConfiguration::Client(ClientConfiguration {
         ssid: WIFI_SSID.try_into()?,
         password: WIFI_PW.try_into()?,
@@ -107,7 +215,7 @@ fn connect_wifi<'a>(
     wifi.wait_netif_up()?;
     log::info!("WIFI connected & ready");
 
-    Ok(wifi)
+    Ok(())
 }
 
 fn sync_time() -> Result<(), Box<dyn Error>> {
@@ -138,113 +246,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let _ = led.set_high();
 
-    let mut _wifi = connect_wifi(peripherals.modem, &sysloop, nvs)?;
+    let mut wifi = BlockingWifi::wrap(
+        EspWifi::new(peripherals.modem, sysloop.clone(), Some(nvs))?,
+        sysloop,
+    )?;
 
-    sync_time()?;
+    let mut now = None;
 
-    let now = Local::now();
-    log::info!("starting time: {}", now.format("%d.%m.%Y %H:%M:%S"));
-
-    let _client = Client::wrap(EspHttpConnection::new(&HttpConfiguration::default())?);
-
-    let entry = Arc::new(Mutex::new(SwitchEntry {
-        time: Local.with_ymd_and_hms(2026, 8, 23, 6, 30, 0).unwrap(),
-    }));
+    let entry: Arc<Mutex<Option<SwitchEntry>>> = Arc::new(Mutex::new(None));
 
     let entry_worker = Arc::clone(&entry);
 
-    let register = thread::spawn(move || {
+    let _ = thread::spawn(move || {
         run_http(&entry);
     });
 
-    let _ = led.set_low();
-
     loop {
-        let now = Local::now();
+        match wifi.is_connected() {
+            Ok(status) => match status {
+                true => {
+                    let mut entry = entry_worker.lock().unwrap();
+                    if let Some(set) = entry.as_ref()
+                        && set.time < now.expect("time not set")
+                    {
+                        request(&json!({
+                            "id": 1,
+                            "method": "Switch.Set",
+                            "params": {
+                                "id": 0,
+                                "on": true,
+                            }
+                        }))?;
 
-        let entry = entry_worker.lock().unwrap();
-        let time_target = entry.time;
-        std::mem::drop(entry);
-
-        if time_target >= now {
-            thread::sleep(Duration::from_secs(60));
-            continue;
-        }
-
-        let body = json!({
-            "id": 1,
-            "method": "Switch.Toggle",
-            "params": {
-                "id": 0
-            }
-        });
-
-        let body = match serde_json::to_string(&body) {
-            Ok(body) => body,
-            Err(e) => {
-                log::error!("JSON-error: {:?}", e);
-                thread::sleep(Duration::from_secs(5));
-                continue;
-            }
-        };
-
-        let headers = [
-            ("Content-Type", "application/json"),
-            ("Content-Length", &body.len().to_string()),
-        ];
-
-        let mut client = match Client::wrap(EspHttpConnection::new(&HttpConfiguration::default())?)
-        {
-            client => client,
-        };
-
-        let mut request = match client.request(Method::Post, DEVICE_ENDPOINT, &headers) {
-            Ok(request) => request,
-            Err(e) => {
-                log::error!("HTTP Request failed {:?}", e);
-                continue;
-            }
-        };
-
-        if let Err(e) = request.write_all(body.as_bytes()) {
-            log::error!("error writing HTTP-Body: {:?}", e);
-            continue;
-        }
-
-        let mut response = match request.submit() {
-            Ok(response) => response,
-            Err(e) => {
-                log::error!("{:?}", e);
-                continue;
-            }
-        };
-
-        log::info!("HTTP-Status: {}", response.status());
-
-        let mut buf = [0u8; 512];
-        let mut response_body = Vec::new();
-
-        loop {
-            match response.read(&mut buf) {
-                Ok(0) => break,
-
-                Ok(n) => {
-                    response_body.extend_from_slice(&buf[..n]);
+                        *entry = None;
+                        std::mem::drop(entry);
+                    }
                 }
+                false => {
+                    let _ = led.set_high();
+                    log::info!("try connectiong");
+                    match connect_wifi(&mut wifi) {
+                        Ok(_) => {
+                            log::info!("wifi connected");
+                            let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
+                            log::info!("ip: {}", ip_info.ip);
+                            sync_time()?;
+                            now = Some(Local::now());
+                            let _ = led.set_low();
+                        }
 
-                Err(e) => {
-                    log::error!("error reading response: {:?}", e);
-                    break;
+                        Err(e) => {
+                            log::error!("wifi connect error: {:?}", e);
+                            continue;
+                        }
+                    };
                 }
-            }
+            },
+            Err(e) => log::error!("wifi connection getStatus error: {:?}", e),
         }
 
-        log::info!("Response: {}", String::from_utf8_lossy(&response_body));
-
-        break ();
+        thread::sleep(Duration::from_secs(30));
     }
-
-    register.join().expect("http server failed");
 
     Ok(())
 }
