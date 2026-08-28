@@ -251,8 +251,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sysloop,
     )?;
 
-    let mut now = None;
-
     let entry: Arc<Mutex<Option<SwitchEntry>>> = Arc::new(Mutex::new(None));
 
     let entry_worker = Arc::clone(&entry);
@@ -267,7 +265,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 true => {
                     let mut entry = entry_worker.lock().unwrap();
                     if let Some(set) = entry.as_ref()
-                        && set.time < now.expect("time not set")
+                        && set.time < Local::now()
                     {
                         request(&json!({
                             "id": 1,
@@ -280,6 +278,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         *entry = None;
                         std::mem::drop(entry);
+                    } else {
+                        log::info!("{:?}", Local::now());
+                        log::info!("nicht erfuellt");
                     }
                 }
                 false => {
@@ -291,7 +292,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
                             log::info!("ip: {}", ip_info.ip);
                             sync_time()?;
-                            now = Some(Local::now());
                             let _ = led.set_low();
                         }
 
