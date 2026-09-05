@@ -47,6 +47,7 @@ impl Logger {
         self.log_message(now, message);
     }
 
+    #[allow(dead_code)]
     pub fn error(&self, message: &str) {
         let now = Local::now();
         log::error!("{:?}: {}", now, message);

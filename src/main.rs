@@ -8,10 +8,6 @@ use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
 use esp_idf_svc::http::server::{Configuration as HttpServerConfig, EspHttpServer};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::sntp::{EspSntp, SntpConf, SyncStatus};
-use esp_idf_svc::wifi::{
-    AuthMethod, BlockingWifi, ClientConfiguration, Configuration as WifiConfiguration, EspWifi,
-};
 use serde::Deserialize;
 use serde_json::json;
 use std::env;
@@ -24,14 +20,18 @@ use std::time::Duration;
 mod logger;
 use crate::logger::Logger;
 
+mod wifi;
+use crate::wifi::WifiManager;
+
+mod time;
+use crate::time::sync_time;
+
 #[derive(Deserialize, Debug)]
 struct SwitchEntry {
     // switch: bool,
     time: DateTime<Local>,
 }
 
-const WIFI_SSID: &str = env!("WIFI_SSID");
-const WIFI_PW: &str = env!("WIFI_PW");
 const DEVICE_ENDPOINT: &str = env!("DEVICE_ENDPOINT");
 
 fn run_http(entry: &Arc<Mutex<Option<SwitchEntry>>>, logger: &Logger) {
@@ -224,36 +224,6 @@ fn request(body: &serde_json::Value) -> Result<String, Box<dyn Error>> {
     Ok(response_body)
 }
 
-fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<(), Box<dyn Error>> {
-    wifi.set_configuration(&WifiConfiguration::Client(ClientConfiguration {
-        ssid: WIFI_SSID.try_into()?,
-        password: WIFI_PW.try_into()?,
-        auth_method: AuthMethod::WPA2Personal,
-        ..Default::default()
-    }))?;
-
-    wifi.start()?;
-    wifi.connect()?;
-    wifi.wait_netif_up()?;
-
-    Ok(())
-}
-
-fn sync_time() -> Result<(), Box<dyn Error>> {
-    unsafe { std::env::set_var("TZ", "CET-1CEST,M3.5.0,M10.5.0/3") };
-
-    let sntp = EspSntp::new(&SntpConf {
-        servers: ["pool.ntp.org"],
-        ..Default::default()
-    })?;
-
-    while sntp.get_sync_status() != SyncStatus::Completed {
-        thread::sleep(Duration::from_secs(1));
-    }
-
-    Ok(())
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
@@ -266,16 +236,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let _ = led.set_high();
 
-    let mut wifi = BlockingWifi::wrap(
-        EspWifi::new(peripherals.modem, sysloop.clone(), Some(nvs))?,
-        sysloop,
-    )?;
+    let logger = Logger::new();
+
+    let mut wifi = WifiManager::new(peripherals.modem, sysloop, Some(nvs), logger.clone())?;
 
     let entry: Arc<Mutex<Option<SwitchEntry>>> = Arc::new(Mutex::new(None));
 
     let entry_worker = Arc::clone(&entry);
-
-    let logger = Logger::new();
 
     let logger_http = logger.clone();
 
@@ -284,53 +251,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     loop {
-        match wifi.is_connected() {
-            Ok(status) => match status {
-                true => {
-                    let mut entry = entry_worker.lock().unwrap();
-                    if let Some(set) = entry.as_ref()
-                        && set.time < Local::now()
-                    {
-                        request(&json!({
-                            "id": 1,
-                            "method": "Switch.Set",
-                            "params": {
-                                "id": 0,
-                                "on": true,
-                            }
-                        }))?;
+        match wifi.check()? {
+            true => {
+                let _ = led.set_low();
 
-                        *entry = None;
-                        std::mem::drop(entry);
-                    }
+                let mut entry = entry_worker.lock().unwrap();
+                if let Some(set) = entry.as_ref()
+                    && set.time < Local::now()
+                {
+                    request(&json!({
+                        "id": 1,
+                        "method": "Switch.Set",
+                        "params": {
+                            "id": 0,
+                            "on": true,
+                        }
+                    }))?;
+
+                    *entry = None;
+                    std::mem::drop(entry);
                 }
-                false => {
-                    let _ = led.set_high();
+            }
 
-                    logger.info("WIFI: try connecting");
-
-                    loop {
-                        match connect_wifi(&mut wifi) {
-                            Ok(_) => {
-                                logger.info("WIFI: conntected & ready");
-                                let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
-                                logger.info(&format!("IP: {}", ip_info.ip));
-                                sync_time()?;
-                                logger.info("Time: synchronized");
-                                let _ = led.set_low();
-                                break;
-                            }
-
-                            Err(e) => {}
-                        };
-                    }
+            false => {
+                if wifi.connect().and_then(|_| sync_time(&logger)).is_ok() {
+                    let _ = led.set_low();
                 }
-            },
-            Err(e) => logger.error(&format!("wifi connection getStatus error: {:?}", e)),
+            }
         }
 
         thread::sleep(Duration::from_secs(30));
     }
-
-    //     Ok(())
 }
