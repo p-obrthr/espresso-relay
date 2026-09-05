@@ -12,8 +12,9 @@ use esp_idf_svc::sntp::{EspSntp, SntpConf, SyncStatus};
 use esp_idf_svc::wifi::{
     AuthMethod, BlockingWifi, ClientConfiguration, Configuration as WifiConfiguration, EspWifi,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::VecDeque;
 use std::env;
 use std::error::Error;
 use std::option::Option;
@@ -27,11 +28,60 @@ struct SwitchEntry {
     time: DateTime<Local>,
 }
 
+#[derive(Clone)]
+struct Logger {
+    messages: Arc<Mutex<VecDeque<LogMessage>>>,
+}
+
+impl Logger {
+    fn new() -> Self {
+        Self {
+            messages: Arc::new(Mutex::new(VecDeque::with_capacity(30))),
+        }
+    }
+
+    fn get_messages(&self) -> Vec<LogMessage> {
+        let messages = self.messages.lock().unwrap();
+        messages.iter().cloned().collect()
+    }
+
+    fn log_message(&self, time: DateTime<Local>, message: &str) {
+        let mut messages = self.messages.lock().unwrap();
+
+        if messages.len() >= 30 {
+            messages.pop_front();
+        }
+
+        messages.push_back(LogMessage {
+            time: time,
+            message: message.to_string(),
+        });
+    }
+
+    fn info(&self, message: &str) {
+        let now = Local::now();
+        log::info!("{:?}: {}", now, message);
+        self.log_message(now, message);
+    }
+
+    fn error(&self, message: &str) {
+        let now = Local::now();
+        log::error!("{:?}: {}", now, message);
+        self.log_message(now, message);
+    }
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct LogMessage {
+    time: DateTime<Local>,
+    message: String,
+}
+
 const WIFI_SSID: &str = env!("WIFI_SSID");
 const WIFI_PW: &str = env!("WIFI_PW");
 const DEVICE_ENDPOINT: &str = env!("DEVICE_ENDPOINT");
 
-fn run_http(entry: &Arc<Mutex<Option<SwitchEntry>>>) {
+fn run_http(entry: &Arc<Mutex<Option<SwitchEntry>>>, logger: &Logger) {
     let mut httpserver = EspHttpServer::new(&HttpServerConfig::default()).unwrap();
 
     let entry_get = Arc::clone(entry);
@@ -141,6 +191,25 @@ fn run_http(entry: &Arc<Mutex<Option<SwitchEntry>>>) {
         )
         .unwrap();
 
+    let logger_get = logger.clone();
+
+    httpserver
+        .fn_handler(
+            "/log",
+            Method::Get,
+            move |req| -> Result<(), Box<dyn Error>> {
+                let messages = logger_get.get_messages();
+
+                let body = serde_json::to_string(&messages)?;
+
+                let mut resp = req.into_ok_response()?;
+                resp.write_all(body.as_bytes())?;
+
+                Ok(())
+            },
+        )
+        .unwrap();
+
     loop {
         thread::sleep(Duration::from_secs(1));
     }
@@ -213,7 +282,6 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<(), Box<dyn
     wifi.start()?;
     wifi.connect()?;
     wifi.wait_netif_up()?;
-    log::info!("WIFI connected & ready");
 
     Ok(())
 }
@@ -230,7 +298,6 @@ fn sync_time() -> Result<(), Box<dyn Error>> {
         thread::sleep(Duration::from_secs(1));
     }
 
-    log::info!("NTP synchronized");
     Ok(())
 }
 
@@ -255,8 +322,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let entry_worker = Arc::clone(&entry);
 
+    let logger = Logger::new();
+
+    let logger_http = logger.clone();
+
     let _ = thread::spawn(move || {
-        run_http(&entry);
+        run_http(&entry, &logger_http);
     });
 
     loop {
@@ -278,31 +349,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         *entry = None;
                         std::mem::drop(entry);
-                    } else {
-                        log::info!("{:?}", Local::now());
-                        log::info!("nicht erfuellt");
                     }
                 }
                 false => {
                     let _ = led.set_high();
-                    log::info!("try connectiong");
-                    match connect_wifi(&mut wifi) {
-                        Ok(_) => {
-                            log::info!("wifi connected");
-                            let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
-                            log::info!("ip: {}", ip_info.ip);
-                            sync_time()?;
-                            let _ = led.set_low();
-                        }
 
-                        Err(e) => {
-                            log::error!("wifi connect error: {:?}", e);
-                            continue;
-                        }
-                    };
+                    logger.info("WIFI: try connecting");
+
+                    loop {
+                        match connect_wifi(&mut wifi) {
+                            Ok(_) => {
+                                logger.info("WIFI: conntected & ready");
+                                let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
+                                logger.info(&format!("IP: {}", ip_info.ip));
+                                sync_time()?;
+                                logger.info("Time: synchronized");
+                                let _ = led.set_low();
+                                break;
+                            }
+
+                            Err(e) => {}
+                        };
+                    }
                 }
             },
-            Err(e) => log::error!("wifi connection getStatus error: {:?}", e),
+            Err(e) => logger.error(&format!("wifi connection getStatus error: {:?}", e)),
         }
 
         thread::sleep(Duration::from_secs(30));
