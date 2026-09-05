@@ -12,9 +12,8 @@ use esp_idf_svc::sntp::{EspSntp, SntpConf, SyncStatus};
 use esp_idf_svc::wifi::{
     AuthMethod, BlockingWifi, ClientConfiguration, Configuration as WifiConfiguration, EspWifi,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
-use std::collections::VecDeque;
 use std::env;
 use std::error::Error;
 use std::option::Option;
@@ -22,59 +21,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+mod logger;
+use crate::logger::Logger;
+
 #[derive(Deserialize, Debug)]
 struct SwitchEntry {
     // switch: bool,
     time: DateTime<Local>,
-}
-
-#[derive(Clone)]
-struct Logger {
-    messages: Arc<Mutex<VecDeque<LogMessage>>>,
-}
-
-impl Logger {
-    fn new() -> Self {
-        Self {
-            messages: Arc::new(Mutex::new(VecDeque::with_capacity(30))),
-        }
-    }
-
-    fn get_messages(&self) -> Vec<LogMessage> {
-        let messages = self.messages.lock().unwrap();
-        messages.iter().cloned().collect()
-    }
-
-    fn log_message(&self, time: DateTime<Local>, message: &str) {
-        let mut messages = self.messages.lock().unwrap();
-
-        if messages.len() >= 30 {
-            messages.pop_front();
-        }
-
-        messages.push_back(LogMessage {
-            time: time,
-            message: message.to_string(),
-        });
-    }
-
-    fn info(&self, message: &str) {
-        let now = Local::now();
-        log::info!("{:?}: {}", now, message);
-        self.log_message(now, message);
-    }
-
-    fn error(&self, message: &str) {
-        let now = Local::now();
-        log::error!("{:?}: {}", now, message);
-        self.log_message(now, message);
-    }
-}
-
-#[derive(Debug, Serialize, Clone)]
-struct LogMessage {
-    time: DateTime<Local>,
-    message: String,
 }
 
 const WIFI_SSID: &str = env!("WIFI_SSID");
@@ -379,5 +332,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         thread::sleep(Duration::from_secs(30));
     }
 
-    Ok(())
+    //     Ok(())
 }
