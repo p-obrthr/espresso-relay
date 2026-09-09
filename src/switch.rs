@@ -3,21 +3,46 @@ use embedded_svc::http::Method;
 use embedded_svc::http::client::Client;
 use embedded_svc::io::Write;
 use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use std::error::Error;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use crate::Logger;
 
 const DEVICE_ENDPOINT: &str = env!("DEVICE_ENDPOINT");
 
 #[derive(Clone)]
 pub struct SwitchManager {
     pub time: Arc<Mutex<Option<DateTime<Local>>>>,
+    logger: Logger,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Status {
+    On,
+    Standby,
+    Off,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetStatusResponse {
+    result: ResultResponse,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResultResponse {
+    output: bool,
+    current: Value,
 }
 
 impl SwitchManager {
-    pub fn new() -> Self {
+    pub fn new(logger: Logger) -> Self {
         Self {
             time: Arc::new(Mutex::new(None)),
+            logger: logger,
         }
     }
 
@@ -25,7 +50,41 @@ impl SwitchManager {
         *self.time.lock().unwrap()
     }
 
-    pub fn get_status(&self) -> Result<String, Box<dyn Error>> {
+    pub fn get_status() -> Result<String, Box<dyn Error>> {
+        let status: Status = Self::get_status_enum()?;
+        Ok(format!("{:?}", status))
+    }
+
+    fn get_status_response() -> Result<GetStatusResponse, Box<dyn Error>> {
+        let res = Self::get_raw_status()?;
+        Ok(serde_json::from_str(&res)?)
+    }
+
+    fn get_status_enum() -> Result<Status, Box<dyn Error>> {
+        let deserialized_resp: GetStatusResponse = Self::get_status_response()?;
+
+        let result = &deserialized_resp.result;
+
+        let mut status = Status::Standby;
+
+        if !result.output {
+            status = Status::Off;
+            return Ok(status);
+        }
+
+        let current = result
+            .current
+            .as_f64()
+            .ok_or("error deserializing current")?;
+
+        if current > 0.0 {
+            status = Status::On;
+        }
+
+        Ok(status)
+    }
+
+    pub fn get_raw_status() -> Result<String, Box<dyn Error>> {
         let body = json!({
             "id": 1,
             "method": "Switch.GetStatus",
@@ -37,28 +96,36 @@ impl SwitchManager {
         Ok(request(&body)?)
     }
 
-    pub fn set_on(&self) -> Result<(), Box<dyn Error>> {
-        let body = json!({
-            "id": 1,
-            "method": "Switch.Set",
-            "params": {
-                "id": 0,
-                "on": true,
-            }
-        });
+    pub fn switch(&self, to: bool) -> Result<String, Box<dyn Error>> {
+        let status = Self::get_status_enum()?;
 
-        request(&body)?;
+        if (status == Status::On && to) || (status == Status::Off && !to) {
+            return Ok(format!("already {:?}", status));
+        }
 
-        Ok(())
+        if status == Status::Standby && to {
+            Self::switch_set_req(false)?;
+            thread::sleep(Duration::from_secs(1));
+            Self::switch_set_req(true)?;
+        } else {
+            Self::switch_set_req(to)?;
+        }
+
+        let new_status = Self::get_status_enum()?;
+
+        let message = format!("switched from {:?} to {:?}", status, new_status);
+        self.logger.info(&message);
+
+        Ok(message)
     }
 
-    pub fn set_off(&self) -> Result<(), Box<dyn Error>> {
+    fn switch_set_req(to: bool) -> Result<(), Box<dyn Error>> {
         let body = json!({
             "id": 1,
             "method": "Switch.Set",
             "params": {
                 "id": 0,
-                "on": false,
+                "on": to,
             }
         });
 
@@ -76,7 +143,7 @@ impl SwitchManager {
         let expired = self.time.lock().unwrap().is_some_and(|t| t < Local::now());
 
         if expired {
-            self.set_on()?;
+            self.switch(true)?;
             *self.time.lock().unwrap() = None;
         }
 
@@ -84,7 +151,7 @@ impl SwitchManager {
     }
 }
 
-fn request(body: &serde_json::Value) -> Result<String, Box<dyn Error>> {
+fn request(body: &Value) -> Result<String, Box<dyn Error>> {
     let body = serde_json::to_vec(body)?;
 
     let content_length = body.len().to_string();

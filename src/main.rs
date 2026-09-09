@@ -29,7 +29,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let logger = Logger::new();
     let mut wifi = WifiManager::new(peripherals.modem, sysloop, Some(nvs), logger.clone())?;
-    let switch_manager = SwitchManager::new();
+
+    let switch_manager = SwitchManager::new(logger.clone());
 
     let switch_manager_http = switch_manager.clone();
     let logger_http = logger.clone();

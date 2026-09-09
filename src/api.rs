@@ -65,8 +65,8 @@ pub fn run_http(switch_manager: &SwitchManager, logger: &Logger) {
             move |req| -> Result<(), Box<dyn Error>> {
                 let mut resp = req.into_ok_response()?;
 
-                match switch_on.set_on() {
-                    Ok(()) => resp.write_all(b"okay")?,
+                match switch_on.switch(true) {
+                    Ok(res) => resp.write_all(res.as_bytes())?,
                     Err(e) => resp.write_all(format!("error {e}").as_bytes())?,
                 }
 
@@ -83,8 +83,8 @@ pub fn run_http(switch_manager: &SwitchManager, logger: &Logger) {
             move |req| -> Result<(), Box<dyn Error>> {
                 let mut resp = req.into_ok_response()?;
 
-                match switch_off.set_off() {
-                    Ok(()) => resp.write_all(b"okay")?,
+                match switch_off.switch(false) {
+                    Ok(res) => resp.write_all(res.as_bytes())?,
                     Err(e) => resp.write_all(format!("error {e}").as_bytes())?,
                 }
 
@@ -93,7 +93,6 @@ pub fn run_http(switch_manager: &SwitchManager, logger: &Logger) {
         )
         .unwrap();
 
-    let switch_status = switch_manager.clone();
     httpserver
         .fn_handler(
             "/status",
@@ -101,7 +100,24 @@ pub fn run_http(switch_manager: &SwitchManager, logger: &Logger) {
             move |req| -> Result<(), Box<dyn Error>> {
                 let mut resp = req.into_ok_response()?;
 
-                match switch_status.get_status() {
+                match SwitchManager::get_status() {
+                    Ok(status) => resp.write_all(status.as_bytes())?,
+                    Err(e) => resp.write_all(format!("error {e}").as_bytes())?,
+                }
+
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    httpserver
+        .fn_handler(
+            "/rawStatus",
+            Method::Get,
+            move |req| -> Result<(), Box<dyn Error>> {
+                let mut resp = req.into_ok_response()?;
+
+                match SwitchManager::get_raw_status() {
                     Ok(status) => resp.write_all(status.as_bytes())?,
                     Err(e) => resp.write_all(format!("error {e}").as_bytes())?,
                 }
